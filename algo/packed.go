@@ -20,6 +20,7 @@ import (
 	"container/heap"
 	"sort"
 
+	"github.com/RoaringBitmap/roaring"
 	"github.com/dgraph-io/dgraph/codec"
 	"github.com/dgraph-io/dgraph/protos/pb"
 )
@@ -28,7 +29,7 @@ import (
 func ApplyFilterPacked(u *pb.UidPack, f func(uint64, int) bool) *pb.UidPack {
 	index := 0
 	decoder := codec.NewDecoder(u)
-	encoder := codec.Encoder{BlockSize: int(u.BlockSize)}
+	encoder := codec.NewEncoder()
 
 	for ; decoder.Valid(); decoder.Next() {
 		for _, uid := range decoder.Uids() {
@@ -42,62 +43,33 @@ func ApplyFilterPacked(u *pb.UidPack, f func(uint64, int) bool) *pb.UidPack {
 	return encoder.Done()
 }
 
-// IntersectWithLinPacked performs the liner intersection between two compressed uid lists.
-func IntersectWithLinPacked(u, v *pb.UidPack) *pb.UidPack {
-	if u == nil || v == nil {
+// IntersectWithLinPacked performs the linear intersection between two compressed uid lists.
+func IntersectWithLinPacked(uidPack1, uidPack2 *pb.UidPack) *pb.UidPack {
+	if uidPack1 == nil || uidPack2 == nil {
 		return nil
 	}
+	result := codec.NewEncoder()
+	if len(uidPack1.Blocks) == 0 || len(uidPack2.Blocks) == 0 {
+		return result.Done()
+	}
+	dec1 := codec.NewDecoder(uidPack1)
+	dec2 := codec.NewDecoder(uidPack2)
+	dec2Idx := 0
+	var uidPack1Msb uint64
+	uidPack2Msb := dec2.Pack.Blocks[dec2Idx].Base
 
-	uDec := codec.NewDecoder(u)
-	uuids := uDec.Uids()
-	vDec := codec.NewDecoder(v)
-	vuids := vDec.Uids()
-	uIdx, vIdx := 0, 0
-	result := codec.Encoder{BlockSize: int(u.BlockSize)}
-
-	for {
-		// Break if the end of a list has been reached.
-		if len(uuids) == 0 || len(vuids) == 0 {
+	for dec1Idx := 0; dec1Idx < len(dec1.Pack.Blocks); dec1Idx++ {
+		uidPack1Msb = dec1.Pack.Blocks[dec1Idx].Base
+		for uidPack1Msb > uidPack2Msb && dec2Idx < len(dec2.Pack.Blocks) {
+			dec2Idx++
+			uidPack2Msb = dec2.Pack.Blocks[dec2Idx].Base
+		}
+		if uidPack1Msb == uidPack2Msb {
+			rb := roaring.And(dec1.RoaringBitmapForBlock(dec1Idx), dec2.RoaringBitmapForBlock(dec2Idx))
+			result.AddBlockFromBitmap(uidPack1Msb, rb, uint32(rb.GetCardinality()))
+		}
+		if dec2Idx == len(dec2.Pack.Blocks)-1 {
 			break
-		}
-
-		// Load the next block of the encoded lists if necessary.
-		if uIdx == len(uuids) {
-			if uDec.Valid() {
-				uuids = uDec.Next()
-				uIdx = 0
-			} else {
-				break
-			}
-
-		}
-		if vIdx == len(vuids) {
-			if vDec.Valid() {
-				vuids = vDec.Next()
-				vIdx = 0
-			} else {
-				break
-			}
-		}
-
-		uLen := len(uuids)
-		vLen := len(vuids)
-
-		for uIdx < uLen && vIdx < vLen {
-			uid := uuids[uIdx]
-			vid := vuids[vIdx]
-			switch {
-			case uid > vid:
-				for vIdx = vIdx + 1; vIdx < vLen && vuids[vIdx] < uid; vIdx++ {
-				}
-			case uid == vid:
-				result.Add(uid)
-				vIdx++
-				uIdx++
-			default:
-				for uIdx = uIdx + 1; uIdx < uLen && uuids[uIdx] < vid; uIdx++ {
-				}
-			}
 		}
 	}
 	return result.Done()
@@ -111,19 +83,19 @@ type listInfoPacked struct {
 
 // IntersectSortedPacked calculates the intersection of multiple lists and performs
 // the intersections from the smallest to the largest list.
-func IntersectSortedPacked(lists []*pb.UidPack) *pb.UidPack {
-	if len(lists) == 0 {
-		encoder := codec.Encoder{BlockSize: 10}
+func IntersectSortedPacked(uidPacks []*pb.UidPack) *pb.UidPack {
+	if len(uidPacks) == 0 {
+		encoder := codec.NewEncoder()
 		return encoder.Done()
 	}
-	ls := make([]listInfoPacked, 0, len(lists))
-	for _, list := range lists {
+	ls := make([]listInfoPacked, 0, len(uidPacks))
+	for _, uidPack := range uidPacks {
 		ls = append(ls, listInfoPacked{
-			l:      list,
-			length: codec.ExactLen(list),
+			l:      uidPack,
+			length: codec.ExactLen(uidPack),
 		})
 	}
-	// Sort the lists based on length.
+	// Sort the uidPacks based on length.
 	sort.Slice(ls, func(i, j int) bool {
 		return ls[i].length < ls[j].length
 	})
@@ -159,7 +131,7 @@ func DifferencePacked(u, v *pb.UidPack) *pb.UidPack {
 		return nil
 	}
 
-	result := codec.Encoder{BlockSize: int(u.BlockSize)}
+	result := codec.NewEncoder()
 
 	uDec := codec.NewDecoder(u)
 	uuids := uDec.Uids()
@@ -269,7 +241,7 @@ func MergeSortedPacked(lists []*pb.UidPack) *pb.UidPack {
 	}
 
 	// Our final result.
-	result := codec.Encoder{BlockSize: blockSize}
+	result := codec.NewEncoder()
 	// emptyResult is used to keep track of whether the encoder contains data since the
 	// encoder storing the final result does not have an equivalent of len.
 	emptyResult := true
